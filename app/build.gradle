@@ -1,0 +1,76 @@
+plugins { id 'com.android.application' }
+
+def releaseStoreFileProp = findProperty('RELEASE_STORE_FILE') ?: System.getenv('RELEASE_STORE_FILE')
+def releaseStorePasswordProp = findProperty('RELEASE_STORE_PASSWORD') ?: System.getenv('RELEASE_STORE_PASSWORD')
+def releaseKeyAliasProp = findProperty('RELEASE_KEY_ALIAS') ?: System.getenv('RELEASE_KEY_ALIAS')
+def releaseKeyPasswordProp = findProperty('RELEASE_KEY_PASSWORD') ?: System.getenv('RELEASE_KEY_PASSWORD')
+def hasReleaseSigning = releaseStoreFileProp && releaseStorePasswordProp && releaseKeyAliasProp && releaseKeyPasswordProp
+
+android {
+    namespace 'com.ctf.dexdumper'
+    compileSdk 34
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseStoreFileProp)
+                storePassword releaseStorePasswordProp
+                keyAlias releaseKeyAliasProp
+                keyPassword releaseKeyPasswordProp
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId 'com.ctf.dexdumper'
+        minSdk 23
+        // target 23 便于 CTF/测试机上使用 XSharedPreferences 与传统外部存储路径。
+        targetSdk 23
+        versionCode 1
+        versionName '1.0'
+
+        ndkVersion '25.1.8937393'
+
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static'
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        // 本模块不是上架 Google Play 的普通 App；targetSdk 23 是为了兼容 LSPosed/XSharedPreferences
+        // 与传统外部存储调试场景，避免 release 构建被 Play target API 检查拦截。
+        disable 'ExpiredTargetSdkVersion'
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    buildTypes {
+        release {
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'de.robv.android.xposed:api:82'
+}

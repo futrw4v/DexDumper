@@ -1,0 +1,27 @@
+# Gradle / build outputs
+.gradle/
+**/build/
+build.log
+build-release.log
+*.log
+
+# NDK / CMake build cache
+app/.cxx/
+
+# Runtime dump output
+dumped/
+
+# Locally installed toolchains/downloads
+/tools/
+
+# Local signing material
+/keystore/
+*.jks
+*.keystore
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+local.properties

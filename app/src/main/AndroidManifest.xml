@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme">
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="Dump runtime DEX (default/data/pointer) of scoped apps for authorized CTF/reverse usage" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver android:name=".ControlReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.ctf.dexdumper.action.DUMP" />
+                <action android:name="com.ctf.dexdumper.action.STATUS" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
