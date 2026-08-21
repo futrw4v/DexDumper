@@ -1,5 +1,7 @@
 package com.ctf.dexdumper;
 
+import android.util.Log;
+
 /**
  * native 桥接。pointer 模式的核心脱壳逻辑在 libdexdumper.so 中。
  *
@@ -11,6 +13,7 @@ public class NativeBridge {
         try {
             System.loadLibrary("dexdumper");
         } catch (Throwable t) {
+            Log.e("DexDumper/native", "load libdexdumper.so failed", t);
             // 模块在目标进程内加载；若 .so 缺失仅影响 pointer 模式，不致命。
         }
     }

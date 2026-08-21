@@ -1,253 +1,412 @@
-// native_dump.cpp — DexDumper pointer mode
-//
-// 全版本兼容策略：不硬编码 ART DexFile 结构体偏移，不依赖被 strip 的 ART 符号。
-//  1) JNI 反射取 dalvik.system.DexFile 的 mCookie / mInternalCookie。
-//  2) 解码 cookie（long[] / Long / Integer / String 自适应），取出候选 DexFile* 指针。
-//  3) 对每个候选指针 p，在 [0,512) 步长 8 扫描：读 q=*(void**)(p+off)，
-//     若 q 指向的内存命中 dex 魔数 "dex\n035/037/038/039"，则 q 即 begin_。
-//  4) size_ 紧邻 begin_（ART 各版本均为 `const uint8_t* begin_; size_t size_;`）→ size=*(size_t*)(p+off+8)。
-//  5) mprotect 翻页为可读（失败忽略）→ write(2) 落盘。
-
+// Native pointer-mode DEX dumper. ART's DexFile layout is private and changes
+// between releases, so the begin_/size_ pair is discovered from DEX magic.
 #include <jni.h>
-#include <cstring>
-#include <cstdint>
-#include <cstdlib>
+#include <android/log.h>
+#include <algorithm>
+#include <cerrno>
 #include <cinttypes>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <pthread.h>
 #include <string>
-#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <fstream>
-#include <sstream>
+#include <vector>
 
 namespace {
-struct Map { uintptr_t start, end; bool r; };
+constexpr char kLogTag[] = "DexDumper/native";
+constexpr size_t kMaxDexSize = 256u * 1024u * 1024u;
 
-pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+struct Map { uintptr_t start; uintptr_t end; int protection; };
+pthread_mutex_t g_mapsLock = PTHREAD_MUTEX_INITIALIZER;
 std::vector<Map> g_maps;
-bool g_maps_ok = false;
+thread_local JNIEnv* g_logEnv = nullptr;
+
+static void javaNativeLog(JNIEnv* env, const char* message);
+
+static void nativeLog(const char* format, ...) {
+    char message[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    __android_log_print(ANDROID_LOG_INFO, kLogTag, "%s", message);
+    // Also mirror native diagnostics into XposedBridge.log while the JNI call
+    // is active, so an operator does not need a separate logcat collection.
+    if (g_logEnv != nullptr) javaNativeLog(g_logEnv, message);
+}
 
 static void refreshMaps() {
-    std::vector<Map> ms;
-    std::ifstream f("/proc/self/maps");
+    std::vector<Map> maps;
+    std::ifstream file("/proc/self/maps");
     std::string line;
-    while (std::getline(f, line)) {
-        // start-end rwxp ...
-        uintptr_t s = 0, e = 0;
-        char perms[5] = {0};
-        if (sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR " %4s", &s, &e, perms) >= 3) {
-            ms.push_back({s, e, perms[0] == 'r'});
+    while (std::getline(file, line)) {
+        uintptr_t start = 0, end = 0;
+        char permissions[5] = {0};
+        if (sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR " %4s",
+                   &start, &end, permissions) >= 3 && start < end) {
+            int protection = 0;
+            if (permissions[0] == 'r') protection |= PROT_READ;
+            if (permissions[1] == 'w') protection |= PROT_WRITE;
+            if (permissions[2] == 'x') protection |= PROT_EXEC;
+            maps.push_back({start, end, protection});
         }
     }
-    pthread_mutex_lock(&g_lock);
-    g_maps = std::move(ms);
-    g_maps_ok = !g_maps.empty();
-    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&g_mapsLock);
+    g_maps.swap(maps);
+    pthread_mutex_unlock(&g_mapsLock);
 }
 
-static bool readable(uintptr_t a, size_t n) {
-    if (!g_maps_ok) refreshMaps();
-    pthread_mutex_lock(&g_lock);
-    bool ok = false;
-    for (const auto& m : g_maps) {
-        if (a >= m.start && a < m.end) {
-            if (a + n <= m.end) ok = m.r;
-            else ok = false;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
-    return ok;
-}
-
-static bool isDexMagic(const uint8_t* p) {
-    if (!readable((uintptr_t)p, 8)) return false;
-    return p[0] == 'd' && p[1] == 'e' && p[2] == 'x' && p[3] == '\n'
-        && p[4] == '0' && p[5] == '3'
-        && (p[6] == '5' || p[6] == '7' || p[6] == '8' || p[6] == '9');
-}
-
-// 在结构体 p 的前 512 字节内找 begin_（指向 dex 魔数的指针），返回 size，0 表示未命中。
-// 命中时直接落盘到 outPath。
-static long tryDumpBeginInStruct(uintptr_t p, const char* outPath) {
-    if (p == 0 || !readable(p, 16)) return 0;
-    for (size_t off = 0; off + 16 <= 512; off += 8) {
-        uintptr_t q = 0;
-        if (!readable(p + off, sizeof(uintptr_t))) continue;
-        std::memcpy(&q, reinterpret_cast<const void*>(p + off), sizeof(uintptr_t));
-        if (q == 0) continue;
-        const uint8_t* qp = reinterpret_cast<const uint8_t*>(q);
-        if (!isDexMagic(qp)) continue;
-        size_t size = 0;
-        if (!readable(p + off + sizeof(uintptr_t), sizeof(size_t))) continue;
-        std::memcpy(&size, reinterpret_cast<const void*>(p + off + sizeof(uintptr_t)), sizeof(size_t));
-        if (size < 0x70 || size > 0x10000000) continue;
-        if (!readable(q, size)) {
-            mprotect(reinterpret_cast<void*>(q), size, PROT_READ);
-            if (!readable(q, size)) continue;
-        }
-        int fd = open(outPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) continue;
-        ssize_t w = write(fd, qp, size);
-        close(fd);
-        if (w == (ssize_t)size) return (long)size;
-        // 部分写入：逐页 mprotect 后拷贝到缓冲再落盘
-        std::vector<uint8_t> tmp(size, 0);
-        bool ok = true;
-        for (size_t i = 0; i < size; ) {
-            long psz = sysconf(_SC_PAGESIZE);
-            size_t chunk = (size_t)psz - ((uintptr_t)qp + i) % (size_t)psz;
-            if (chunk > size - i) chunk = size - i;
-            if (!readable((uintptr_t)qp + i, chunk)) {
-                mprotect((void*)((uintptr_t)(((uintptr_t)qp + i) & ~((uintptr_t)psz - 1))), (size_t)psz, PROT_READ);
-                if (!readable((uintptr_t)qp + i, chunk)) { ok = false; break; }
+// Check every mapping crossed by [address, address + length), not just one
+// /proc/self/maps row. Large DEX images commonly cross several rows.
+static bool rangeReadable(uintptr_t address, size_t length) {
+    if (length == 0) return true;
+    if (address > UINTPTR_MAX - length) return false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        pthread_mutex_lock(&g_mapsLock);
+        uintptr_t cursor = address;
+        const uintptr_t end = address + length;
+        while (cursor < end) {
+            const Map* found = nullptr;
+            for (const Map& map : g_maps) {
+                if (cursor >= map.start && cursor < map.end) { found = &map; break; }
             }
-            std::memcpy(tmp.data() + i, qp + i, chunk);
-            i += chunk;
+            if (found == nullptr || !(found->protection & PROT_READ)) {
+                pthread_mutex_unlock(&g_mapsLock);
+                if (attempt == 0) refreshMaps();
+                cursor = 0;
+                break;
+            }
+            cursor = found->end < end ? found->end : end;
         }
-        if (ok) {
-            fd = open(outPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) { ssize_t w2 = write(fd, tmp.data(), size); close(fd); if (w2 == (ssize_t)size) return (long)size; }
+        if (cursor == end) {
+            pthread_mutex_unlock(&g_mapsLock);
+            return true;
         }
+        if (attempt == 1) return false;
+    }
+    return false;
+}
+
+static int protectionAt(uintptr_t address) {
+    pthread_mutex_lock(&g_mapsLock);
+    for (const Map& map : g_maps) {
+        if (address >= map.start && address < map.end) {
+            const int protection = map.protection;
+            pthread_mutex_unlock(&g_mapsLock);
+            return protection;
+        }
+    }
+    pthread_mutex_unlock(&g_mapsLock);
+    return -1;
+}
+
+static bool rangeMapped(uintptr_t address, size_t length) {
+    if (length == 0 || address > UINTPTR_MAX - length) return false;
+    pthread_mutex_lock(&g_mapsLock);
+    uintptr_t cursor = address;
+    const uintptr_t end = address + length;
+    while (cursor < end) {
+        const Map* found = nullptr;
+        for (const Map& map : g_maps) {
+            if (cursor >= map.start && cursor < map.end) { found = &map; break; }
+        }
+        if (found == nullptr) {
+            pthread_mutex_unlock(&g_mapsLock);
+            return false;
+        }
+        cursor = found->end < end ? found->end : end;
+    }
+    pthread_mutex_unlock(&g_mapsLock);
+    return true;
+}
+
+static uintptr_t pageStart(uintptr_t address, size_t pageSize) {
+    return address & ~(static_cast<uintptr_t>(pageSize) - 1u);
+}
+
+// mprotect requires page-aligned ranges. The previous implementation passed
+// the raw DEX pointer, causing EINVAL and a silent zero-byte dump on Android 14.
+static bool makeReadable(uintptr_t address, size_t length) {
+    if (rangeReadable(address, length)) return true;
+    // Never attempt mprotect across an unmapped hole. This also prevents a
+    // corrupt header from causing tens of thousands of noisy failed calls.
+    if (!rangeMapped(address, length)) return false;
+    const long configuredPageSize = sysconf(_SC_PAGESIZE);
+    const size_t pageSize = configuredPageSize > 0
+            ? static_cast<size_t>(configuredPageSize) : 4096u;
+    if (address > UINTPTR_MAX - length) return false;
+    const uintptr_t first = pageStart(address, pageSize);
+    const uintptr_t last = pageStart(address + length - 1u, pageSize);
+    for (uintptr_t page = first;; page += pageSize) {
+        int protection = protectionAt(page);
+        if (protection >= 0 && mprotect(reinterpret_cast<void*>(page), pageSize,
+                                       protection | PROT_READ) != 0 && errno != EACCES) {
+            nativeLog("mprotect page=%" PRIxPTR " failed errno=%d", page, errno);
+        }
+        if (page == last || page > UINTPTR_MAX - pageSize) break;
+    }
+    refreshMaps();
+    return rangeReadable(address, length);
+}
+
+static bool readMemory(uintptr_t address, void* destination, size_t length) {
+    if (!makeReadable(address, length)) return false;
+    std::memcpy(destination, reinterpret_cast<const void*>(address), length);
+    return true;
+}
+
+static bool readPointer(uintptr_t address, uintptr_t* value) {
+    return value != nullptr && readMemory(address, value, sizeof(*value));
+}
+
+static bool readU32(uintptr_t address, uint32_t* value) {
+    return value != nullptr && readMemory(address, value, sizeof(*value));
+}
+
+enum class DexFormat { NONE, DEX, CDEX };
+
+static DexFormat dexFormat(uintptr_t address, char version[4]) {
+    uint8_t magic[8] = {0};
+    if (!readMemory(address, magic, sizeof(magic))) return DexFormat::NONE;
+    if (magic[0] == 'd' && magic[1] == 'e' && magic[2] == 'x' && magic[3] == '\n' &&
+            magic[4] == '0' && magic[5] == '3' && magic[6] >= '5' && magic[6] <= '9' &&
+            magic[7] == '\0') {
+        if (version != nullptr) {
+            version[0] = static_cast<char>(magic[4]);
+            version[1] = static_cast<char>(magic[5]);
+            version[2] = static_cast<char>(magic[6]);
+            version[3] = '\0';
+        }
+        return DexFormat::DEX;
+    }
+    if (magic[0] == 'c' && magic[1] == 'd' && magic[2] == 'e' && magic[3] == 'x' &&
+            magic[4] == '0' && magic[5] == '0' && magic[6] == '1' && magic[7] == '\0') {
+        if (version != nullptr) std::memcpy(version, "001", 4);
+        return DexFormat::CDEX;
+    }
+    return DexFormat::NONE;
+}
+
+static bool writeAll(int fd, const uint8_t* bytes, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        const ssize_t result = write(fd, bytes + written, length - written);
+        if (result > 0) written += static_cast<size_t>(result);
+        else if (result < 0 && errno == EINTR) continue;
+        else return false;
+    }
+    return true;
+}
+
+static bool copyMemory(uintptr_t address, size_t length, std::vector<uint8_t>* output) {
+    if (output == nullptr || length == 0 || length > kMaxDexSize) return false;
+    output->resize(length);
+    if (!makeReadable(address, length)) return false;
+    // The common case is one readable range; use one memcpy for speed.
+    if (rangeReadable(address, length)) {
+        std::memcpy(output->data(), reinterpret_cast<const void*>(address), length);
+        return true;
+    }
+    const long configuredPageSize = sysconf(_SC_PAGESIZE);
+    const size_t pageSize = configuredPageSize > 0
+            ? static_cast<size_t>(configuredPageSize) : 4096u;
+    for (size_t offset = 0; offset < length;) {
+        const size_t chunk = std::min(pageSize - ((address + offset) % pageSize), length - offset);
+        if (!readMemory(address + offset, output->data() + offset, chunk)) return false;
+        offset += chunk;
+    }
+    return true;
+}
+
+static bool dumpDexImage(uintptr_t begin, size_t hintedSize, const char* outputPath,
+                         long* writtenSize) {
+    char version[4] = {0};
+    const DexFormat format = dexFormat(begin, version);
+    if (format == DexFormat::NONE) return false;
+    uint32_t declaredSize = 0;
+    size_t imageSize = 0;
+    if (readU32(begin + 0x20, &declaredSize) && declaredSize >= 0x70 &&
+            declaredSize <= kMaxDexSize) imageSize = declaredSize;
+    if ((imageSize < 0x70 || imageSize > kMaxDexSize) &&
+            hintedSize >= 0x70 && hintedSize <= kMaxDexSize) imageSize = hintedSize;
+    if (imageSize < 0x70 || imageSize > kMaxDexSize) return false;
+
+    std::vector<uint8_t> image;
+    if (!copyMemory(begin, imageSize, &image)) return false;
+    const int fd = open(outputPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const bool ok = writeAll(fd, image.data(), image.size());
+    close(fd);
+    if (!ok) return false;
+    if (writtenSize != nullptr) *writtenSize = static_cast<long>(image.size());
+    nativeLog("matched %s version=%s begin=%" PRIxPTR " size=%zu",
+              format == DexFormat::CDEX ? "CDEX" : "DEX", version, begin, imageSize);
+    return true;
+}
+
+// Search an ART object for a pointer to DEX bytes followed by its size field.
+static long tryDumpBeginInStruct(uintptr_t object, const char* outputPath,
+                                 int* magicCandidates) {
+    if (object == 0 || !makeReadable(object, 16)) return 0;
+    for (size_t offset = 0; offset + 16 <= 512; offset += sizeof(uintptr_t)) {
+        uintptr_t begin = 0;
+        if (!readPointer(object + offset, &begin) || begin == 0) continue;
+        char version[4] = {0};
+        const DexFormat format = dexFormat(begin, version);
+        if (format == DexFormat::NONE) continue;
+        if (magicCandidates != nullptr) ++(*magicCandidates);
+        size_t hintedSize = 0;
+        const uintptr_t sizeAddress = object + offset + sizeof(uintptr_t);
+        if (sizeof(size_t) == 8) {
+            uint64_t value = 0;
+            if (readMemory(sizeAddress, &value, sizeof(value))) hintedSize = static_cast<size_t>(value);
+        } else {
+            uint32_t value = 0;
+            if (readU32(sizeAddress, &value)) hintedSize = value;
+        }
+        long written = 0;
+        if (dumpDexImage(begin, hintedSize, outputPath, &written)) return written;
+        nativeLog("DEX magic candidate at object+0x%zx was not a complete readable image", offset);
     }
     return 0;
 }
 
-static long dumpFromPtr(uintptr_t dexFilePtr, const char* outPath) {
-    if (dexFilePtr == 0) return 0;
-    // Level 1：p 本身即 art::DexFile*，begin_ 直接在其结构体内
-    long sz = tryDumpBeginInStruct(dexFilePtr, outPath);
-    if (sz > 0) return sz;
-    // Level 2：p 可能是 OatDexFile* 等中间结构，其中某指针字段指向真正的 DexFile*
-    if (!readable(dexFilePtr, 16)) return 0;
-    for (size_t off = 0; off + sizeof(uintptr_t) <= 256; off += 8) {
-        uintptr_t q = 0;
-        if (!readable(dexFilePtr + off, sizeof(uintptr_t))) continue;
-        std::memcpy(&q, reinterpret_cast<const void*>(dexFilePtr + off), sizeof(uintptr_t));
-        if (q == 0) continue;
-        sz = tryDumpBeginInStruct(q, outPath);
-        if (sz > 0) return sz;
+static long dumpFromPtr(uintptr_t dexFilePointer, const char* outputPath, int* magicCandidates) {
+    if (dexFilePointer == 0) return 0;
+    long size = tryDumpBeginInStruct(dexFilePointer, outputPath, magicCandidates);
+    if (size > 0) return size;
+    // A cookie can point at an intermediate ART object containing DexFile*.
+    if (!makeReadable(dexFilePointer, 16)) return 0;
+    for (size_t offset = 0; offset + sizeof(uintptr_t) <= 256; offset += sizeof(uintptr_t)) {
+        uintptr_t nested = 0;
+        if (!readPointer(dexFilePointer + offset, &nested) || nested == 0 ||
+                nested == dexFilePointer) continue;
+        size = tryDumpBeginInStruct(nested, outputPath, magicCandidates);
+        if (size > 0) return size;
     }
     return 0;
 }
 
-// ---- JNI 反射工具：按名取字段值（沿继承链），LSPosed 已 unseal hidden API ----
-
+// JNI reflection helper: find a field along the DexFile class hierarchy.
 static jobject readFieldByName(JNIEnv* env, jobject target, const char* name) {
-    if (!target) return nullptr;
-    jclass classCls = env->FindClass("java/lang/Class");
-    jmethodID getDeclaredField = env->GetMethodID(classCls, "getDeclaredField",
-        "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
-    jmethodID getSuperclass = env->GetMethodID(classCls, "getSuperclass", "()Ljava/lang/Class;");
-    jclass fieldCls = env->FindClass("java/lang/reflect/Field");
-    jmethodID setAccessible = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
-    jmethodID fieldGet = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
-
-    jclass cls = env->GetObjectClass(target);
-    jobject result = nullptr;
-    while (cls != nullptr) {
-        env->ExceptionClear();
-        jstring jname = env->NewStringUTF(name);
-        jobject field = env->CallObjectMethod(cls, getDeclaredField, jname);
-        env->DeleteLocalRef(jname);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); }
+    if (env == nullptr || target == nullptr) return nullptr;
+    jclass classClass = env->FindClass("java/lang/Class");
+    jclass fieldClass = env->FindClass("java/lang/reflect/Field");
+    if (classClass == nullptr || fieldClass == nullptr) { env->ExceptionClear(); return nullptr; }
+    const jmethodID getDeclaredField = env->GetMethodID(classClass, "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;");
+    const jmethodID getSuperclass = env->GetMethodID(classClass, "getSuperclass", "()Ljava/lang/Class;");
+    const jmethodID setAccessible = env->GetMethodID(fieldClass, "setAccessible", "(Z)V");
+    const jmethodID fieldGet = env->GetMethodID(fieldClass, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    jclass current = env->GetObjectClass(target);
+    while (current != nullptr) {
+        jstring fieldName = env->NewStringUTF(name);
+        jobject field = env->CallObjectMethod(current, getDeclaredField, fieldName);
+        env->DeleteLocalRef(fieldName);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); field = nullptr; }
         if (field != nullptr) {
             env->CallVoidMethod(field, setAccessible, JNI_TRUE);
             if (env->ExceptionCheck()) env->ExceptionClear();
-            result = env->CallObjectMethod(field, fieldGet, target);
-            if (env->ExceptionCheck()) { env->ExceptionClear(); result = nullptr; }
+            jobject value = env->CallObjectMethod(field, fieldGet, target);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); value = nullptr; }
             env->DeleteLocalRef(field);
-            env->DeleteLocalRef(cls);
-            return result;
+            env->DeleteLocalRef(current);
+            return value;
         }
-        jclass sup = (jclass) env->CallObjectMethod(cls, getSuperclass);
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(cls);
-        cls = sup;
-        if (cls == env->FindClass("java/lang/Object")) { env->DeleteLocalRef(cls); break; }
+        jclass parent = reinterpret_cast<jclass>(env->CallObjectMethod(current, getSuperclass));
+        if (env->ExceptionCheck()) { env->ExceptionClear(); parent = nullptr; }
+        env->DeleteLocalRef(current);
+        current = parent;
     }
     return nullptr;
 }
 
-// native 侧统一写日志到 XposedBridge.log（通过调用 Java 静态方法 NativeBridge.nativeLog）
-static void NativeBridge_nativeLog(JNIEnv* env, const char* msg) {
-    if (!env || !msg) return;
-    jclass cls = env->FindClass("com/ctf/dexdumper/NativeBridge");
+static void javaNativeLog(JNIEnv* env, const char* message) {
+    if (env == nullptr || message == nullptr) return;
+    jclass bridge = env->FindClass("com/ctf/dexdumper/NativeBridge");
     if (env->ExceptionCheck()) env->ExceptionClear();
-    if (!cls) return;
-    jmethodID mid = env->GetStaticMethodID(cls, "nativeLog", "(Ljava/lang/String;)V");
+    if (bridge == nullptr) return;
+    const jmethodID method = env->GetStaticMethodID(bridge, "nativeLog", "(Ljava/lang/String;)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
-    if (mid) {
-        jstring jmsg = env->NewStringUTF(msg);
-        env->CallStaticVoidMethod(cls, mid, jmsg);
+    if (method != nullptr) {
+        jstring text = env->NewStringUTF(message);
+        env->CallStaticVoidMethod(bridge, method, text);
         if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(jmsg);
+        env->DeleteLocalRef(text);
     }
-    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(bridge);
 }
 
-} // namespace anon
+} // namespace
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_ctf_dexdumper_NativeBridge_dumpDexFromDexFile(
-        JNIEnv* env, jclass, jobject dexFile, jstring outPathJ) {
-    if (!dexFile || !outPathJ) return -1;
-    const char* outPath = env->GetStringUTFChars(outPathJ, nullptr);
-    if (!outPath) return -1;
-    std::string path(outPath);
-    env->ReleaseStringUTFChars(outPathJ, outPath);
+        JNIEnv* env, jclass, jobject dexFile, jstring outputPathString) {
+    if (env == nullptr || dexFile == nullptr || outputPathString == nullptr) return -1;
+    g_logEnv = env;
+    const char* outputPathChars = env->GetStringUTFChars(outputPathString, nullptr);
+    if (outputPathChars == nullptr) { g_logEnv = nullptr; return -1; }
+    const std::string outputPath(outputPathChars);
+    env->ReleaseStringUTFChars(outputPathString, outputPathChars);
 
     refreshMaps();
-
-    // 1) 取 cookie：优先 mCookie，回退 mInternalCookie
     jobject cookie = readFieldByName(env, dexFile, "mCookie");
-    if (!cookie) cookie = readFieldByName(env, dexFile, "mInternalCookie");
-    if (!cookie) {
-        NativeBridge_nativeLog(env, "no mCookie/mInternalCookie on DexFile");
+    if (cookie == nullptr) cookie = readFieldByName(env, dexFile, "mInternalCookie");
+    if (cookie == nullptr) {
+        javaNativeLog(env, "no mCookie/mInternalCookie on DexFile");
+        g_logEnv = nullptr;
         return -2;
     }
 
-    // 2) 解码 cookie 类型
     std::vector<uintptr_t> candidates;
-    jclass longArrayCls = env->FindClass("[J");       // long[]
-    jclass longCls = env->FindClass("java/lang/Long");
-    jclass intCls = env->FindClass("java/lang/Integer");
-    jclass strCls = env->FindClass("java/lang/String");
-
-    if (env->IsInstanceOf(cookie, longArrayCls)) {
-        jlongArray arr = reinterpret_cast<jlongArray>(cookie);
-        jsize n = env->GetArrayLength(arr);
-        std::vector<jlong> buf(n);
-        env->GetLongArrayRegion(arr, 0, n, buf.data());
-        for (jlong v : buf) {
-            candidates.push_back((uintptr_t)v);
-        }
-    } else if (env->IsInstanceOf(cookie, longCls)) {
-        jmethodID lv = env->GetMethodID(longCls, "longValue", "()J");
-        candidates.push_back((uintptr_t) env->CallLongMethod(cookie, lv));
-    } else if (env->IsInstanceOf(cookie, intCls)) {
-        jmethodID iv = env->GetMethodID(intCls, "intValue", "()I");
-        candidates.push_back((uintptr_t)(uint32_t) env->CallIntMethod(cookie, iv));
-    } else if (env->IsInstanceOf(cookie, strCls)) {
-        NativeBridge_nativeLog(env, "cookie is String (oat path), pointer mode needs long[]/Long/Integer cookie");
+    jclass longArrayClass = env->FindClass("[J");
+    jclass longClass = env->FindClass("java/lang/Long");
+    jclass integerClass = env->FindClass("java/lang/Integer");
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (longArrayClass != nullptr && env->IsInstanceOf(cookie, longArrayClass)) {
+        const jlongArray array = reinterpret_cast<jlongArray>(cookie);
+        const jsize count = env->GetArrayLength(array);
+        std::vector<jlong> values(static_cast<size_t>(count));
+        env->GetLongArrayRegion(array, 0, count, values.data());
+        for (jlong value : values) candidates.push_back(static_cast<uintptr_t>(value));
+        nativeLog("cookie type=long[] entries=%d", static_cast<int>(count));
+    } else if (longClass != nullptr && env->IsInstanceOf(cookie, longClass)) {
+        const jmethodID method = env->GetMethodID(longClass, "longValue", "()J");
+        candidates.push_back(static_cast<uintptr_t>(env->CallLongMethod(cookie, method)));
+        nativeLog("cookie type=Long entries=1");
+    } else if (integerClass != nullptr && env->IsInstanceOf(cookie, integerClass)) {
+        const jmethodID method = env->GetMethodID(integerClass, "intValue", "()I");
+        candidates.push_back(static_cast<uintptr_t>(static_cast<uint32_t>(env->CallIntMethod(cookie, method))));
+        nativeLog("cookie type=Integer entries=1");
+    } else if (stringClass != nullptr && env->IsInstanceOf(cookie, stringClass)) {
+        javaNativeLog(env, "cookie type=String (oat path), pointer mode requires a native cookie");
         env->DeleteLocalRef(cookie);
+        g_logEnv = nullptr;
         return -3;
     } else {
-        // 未知类型，尝试把它当 long[] 不行就放弃
-        NativeBridge_nativeLog(env, "cookie has unknown type, skip");
+        javaNativeLog(env, "cookie type=unknown; expected long[]/Long/Integer");
         env->DeleteLocalRef(cookie);
+        g_logEnv = nullptr;
         return -4;
     }
     env->DeleteLocalRef(cookie);
 
-    // 3) 对每个候选指针尝试 dump
+    int magicCandidates = 0;
     long best = 0;
-    for (uintptr_t p : candidates) {
-        if (p == 0) continue;
-        long sz = dumpFromPtr(p, path.c_str());
-        if (sz > 0) { best = sz; break; }
+    for (uintptr_t candidate : candidates) {
+        if (candidate == 0) continue;
+        const long dumped = dumpFromPtr(candidate, outputPath.c_str(), &magicCandidates);
+        if (dumped > 0) { best = dumped; break; }
     }
-    return (jint) best;
+    nativeLog("pointer scan candidates=%zu dexMagicCandidates=%d result=%ld",
+              candidates.size(), magicCandidates, best);
+    if (best == 0) javaNativeLog(env, "pointer scan completed with no readable DEX image");
+    g_logEnv = nullptr;
+    return static_cast<jint>(best);
 }

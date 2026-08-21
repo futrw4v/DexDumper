@@ -26,8 +26,8 @@ android {
         minSdk 23
         // target 23 便于 CTF/测试机上使用 XSharedPreferences 与传统外部存储路径。
         targetSdk 23
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
 
         ndkVersion '25.1.8937393'
 

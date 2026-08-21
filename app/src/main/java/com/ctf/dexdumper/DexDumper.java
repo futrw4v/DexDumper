@@ -47,8 +47,8 @@ public final class DexDumper {
     private static Config sCfg;
     private static File sOutDir;
 
-    /** data 模式：按 ClassLoader 缓存其内存加载的 ByteBuffer[]。 */
-    private static final Map<ClassLoader, List<ByteBuffer>> sMemDex = new java.util.WeakHashMap<>();
+    /** data 模式：在 ART 消费前深拷贝内存 DEX，避免原 ByteBuffer 随后被清零或复用。 */
+    private static final Map<ClassLoader, List<byte[]>> sMemDex = new java.util.WeakHashMap<>();
     /** 去重：已落盘 dex 的 sha1。 */
     private static final List<String> sWrittenSha = new ArrayList<>();
 
@@ -208,10 +208,10 @@ public final class DexDumper {
         if (e.dexFile == null) return out;
         // 1) 优先查 ClassLoader 缓存的内存 ByteBuffer（DexPathList.<init> 捕获）
         synchronized (sMemDex) {
-            for (Map.Entry<ClassLoader, List<ByteBuffer>> en : sMemDex.entrySet()) {
+            for (Map.Entry<ClassLoader, List<byte[]>> en : sMemDex.entrySet()) {
                 // 无法精确关联 entry 与 loader，data 模式把所有缓存一次性 dump（去重由 sha 保证）
-                for (ByteBuffer bb : en.getValue()) {
-                    out.add(writeByteBuffer(bb));
+                for (byte[] bytes : en.getValue()) {
+                    out.add(writeBytes(bytes));
                 }
             }
         }
@@ -236,8 +236,11 @@ public final class DexDumper {
             if (n > 0 && tmp.exists() && tmp.length() > 0) {
                 out.add(tmp);
             } else {
+                XposedBridge.log(TAG + "pointer returned " + n + " for " + e.sourcePath
+                        + ", trying captured-memory fallback");
                 //noinspection ResultOfMethodCallIgnored
                 tmp.delete();
+                out.addAll(dumpData(e));
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + "pointer native call failed: " + t);
@@ -248,32 +251,78 @@ public final class DexDumper {
     // ---------------------------------------------------------------- hooks
 
     private static void installDataHook(Config cfg) {
-        // hook DexPathList.<init>(ClassLoader, ByteBuffer[]) —— InMemoryDexClassLoader 路径
+        // Android 各版本的 DexPathList(ByteBuffer...) 参数签名不同。Hook 全部构造器，
+        // 动态定位 ByteBuffer[]，避免 Android 14 上 exact signature 抛 NoSuchMethodError。
         try {
             Class<?> dexPathList = Class.forName("dalvik.system.DexPathList");
-            XposedHelpers.findAndHookConstructor(dexPathList,
-                    ClassLoader.class, ByteBuffer[].class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                Object thisObj = param.thisObject;
-                                ClassLoader owner = readOwner(thisObj);
-                                ByteBuffer[] bufs = (ByteBuffer[]) param.args[1];
-                                if (bufs == null || bufs.length == 0) return;
-                                synchronized (sMemDex) {
-                                    sMemDex.put(owner, new ArrayList<>(Arrays.asList(bufs)));
-                                }
-                                XposedBridge.log(TAG + "data: captured " + bufs.length
-                                        + " in-memory ByteBuffer(s) for " + owner);
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + "data hook after failed: " + t);
-                            }
-                        }
-                    });
-            XposedBridge.log(TAG + "data hook installed (DexPathList.<init> ByteBuffer[])");
+            final int hooked = XposedBridge.hookAllConstructors(dexPathList, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    captureConstructorBuffers(param.args, null);
+                }
+
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    captureConstructorBuffers(param.args, readOwner(param.thisObject));
+                }
+            }).size();
+            XposedBridge.log(TAG + "data hook installed across " + hooked
+                    + " DexPathList constructor(s)");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "data hook install failed: " + t);
+        }
+    }
+
+    private static void captureConstructorBuffers(Object[] args, ClassLoader fallbackOwner) {
+        if (args == null) return;
+        ClassLoader owner = fallbackOwner;
+        ByteBuffer[] buffers = null;
+        for (Object arg : args) {
+            if (arg instanceof ClassLoader) owner = (ClassLoader) arg;
+            if (arg instanceof ByteBuffer[]) buffers = (ByteBuffer[]) arg;
+        }
+        if (buffers == null || buffers.length == 0) return;
+        if (owner == null) owner = Thread.currentThread().getContextClassLoader();
+
+        List<byte[]> snapshots = new ArrayList<>();
+        for (ByteBuffer buffer : buffers) {
+            byte[] snapshot = snapshotDexBuffer(buffer);
+            if (snapshot != null && snapshot.length > 0) snapshots.add(snapshot);
+        }
+        if (snapshots.isEmpty()) return;
+        synchronized (sMemDex) {
+            List<byte[]> existing = sMemDex.get(owner);
+            if (existing == null) {
+                existing = new ArrayList<>();
+                sMemDex.put(owner, existing);
+            }
+            existing.addAll(snapshots);
+        }
+        XposedBridge.log(TAG + "data: captured " + snapshots.size()
+                + " in-memory dex buffer(s) for " + owner);
+    }
+
+    static byte[] snapshotDexBuffer(ByteBuffer source) {
+        if (source == null) return null;
+        try {
+            ByteBuffer copy = source.duplicate();
+            copy.clear();
+            int length = copy.remaining();
+            if (length < 0x70 || length > 0x20000000) return null;
+            if (length >= 0x24) {
+                int declared = (copy.get(0x20) & 0xff)
+                        | ((copy.get(0x21) & 0xff) << 8)
+                        | ((copy.get(0x22) & 0xff) << 16)
+                        | ((copy.get(0x23) & 0xff) << 24);
+                if (declared >= 0x70 && declared <= length) length = declared;
+            }
+            byte[] bytes = new byte[length];
+            copy.position(0);
+            copy.get(bytes, 0, length);
+            return bytes;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "data buffer snapshot failed: " + t);
+            return null;
         }
     }
 

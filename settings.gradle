@@ -1,5 +1,8 @@
 pluginManagement {
     repositories {
+        // Mainland mirror keeps first-time builds from hanging when Google
+        // Maven is unreachable; the official repositories remain fallbacks.
+        maven { url 'https://maven.aliyun.com/repository/public' }
         google()
         mavenCentral()
         gradlePluginPortal()
@@ -8,6 +11,7 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        maven { url 'https://maven.aliyun.com/repository/public' }
         google()
         mavenCentral()
         maven { url 'https://api.xposed.info/' }
