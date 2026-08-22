@@ -1,7 +1,8 @@
 # Gradle / build outputs
 .gradle/
 **/build/
-/dist/
+/dist/*
+!/dist/DexDumper-release.apk
 build.log
 build-release.log
 *.log
