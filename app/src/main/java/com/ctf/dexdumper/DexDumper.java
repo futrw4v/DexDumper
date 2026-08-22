@@ -235,6 +235,16 @@ public final class DexDumper {
             int n = NativeBridge.dumpDexFromDexFile(e.dexFile, tmp.getAbsolutePath());
             if (n > 0 && tmp.exists() && tmp.length() > 0) {
                 out.add(tmp);
+                // One ART DexFile may own several native DexFile instances
+                // (mCookie is a long[] for multidex).  NativeBridge writes
+                // the additional images next to the requested temp file as
+                // <path>.1, <path>.2, ... .  Keep all of them so the normal
+                // SHA-1 de-duplication/rename path can publish each image.
+                for (int extra = 1; extra < 64; extra++) {
+                    File sibling = new File(tmp.getAbsolutePath() + "." + extra);
+                    if (!sibling.exists()) break;
+                    if (sibling.isFile() && sibling.length() > 0) out.add(sibling);
+                }
             } else {
                 XposedBridge.log(TAG + "pointer returned " + n + " for " + e.sourcePath
                         + ", trying captured-memory fallback");

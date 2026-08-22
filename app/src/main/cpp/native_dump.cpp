@@ -15,11 +15,21 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <deque>
+#include <unordered_set>
 #include <vector>
 
 namespace {
 constexpr char kLogTag[] = "DexDumper/native";
 constexpr size_t kMaxDexSize = 256u * 1024u * 1024u;
+// NativeDexFile/DexFile layouts are private ART implementation details.  A
+// cookie may therefore point at either object, with one or more pointer
+// indirections before the actual DexFile.  Keep the graph walk bounded: the
+// cookie is trusted input from ART, but arbitrary pointer chasing must never
+// turn a failed dump into an unbounded scan of the process address space.
+constexpr size_t kObjectScanBytes = 2048u;
+constexpr size_t kMaxGraphNodes = 16u;
+constexpr int kMaxGraphDepth = 2;
 
 struct Map { uintptr_t start; uintptr_t end; int protection; };
 pthread_mutex_t g_mapsLock = PTHREAD_MUTEX_INITIALIZER;
@@ -63,33 +73,31 @@ static void refreshMaps() {
 
 // Check every mapping crossed by [address, address + length), not just one
 // /proc/self/maps row. Large DEX images commonly cross several rows.
-static bool rangeReadable(uintptr_t address, size_t length) {
+static bool rangeReadableCached(uintptr_t address, size_t length) {
     if (length == 0) return true;
     if (address > UINTPTR_MAX - length) return false;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        pthread_mutex_lock(&g_mapsLock);
-        uintptr_t cursor = address;
-        const uintptr_t end = address + length;
-        while (cursor < end) {
-            const Map* found = nullptr;
-            for (const Map& map : g_maps) {
-                if (cursor >= map.start && cursor < map.end) { found = &map; break; }
-            }
-            if (found == nullptr || !(found->protection & PROT_READ)) {
-                pthread_mutex_unlock(&g_mapsLock);
-                if (attempt == 0) refreshMaps();
-                cursor = 0;
-                break;
-            }
-            cursor = found->end < end ? found->end : end;
+    pthread_mutex_lock(&g_mapsLock);
+    uintptr_t cursor = address;
+    const uintptr_t end = address + length;
+    while (cursor < end) {
+        const Map* found = nullptr;
+        for (const Map& map : g_maps) {
+            if (cursor >= map.start && cursor < map.end) { found = &map; break; }
         }
-        if (cursor == end) {
+        if (found == nullptr || !(found->protection & PROT_READ)) {
             pthread_mutex_unlock(&g_mapsLock);
-            return true;
+            return false;
         }
-        if (attempt == 1) return false;
+        cursor = found->end < end ? found->end : end;
     }
-    return false;
+    pthread_mutex_unlock(&g_mapsLock);
+    return true;
+}
+
+static bool rangeReadable(uintptr_t address, size_t length) {
+    if (rangeReadableCached(address, length)) return true;
+    refreshMaps();
+    return rangeReadableCached(address, length);
 }
 
 static int protectionAt(uintptr_t address) {
@@ -168,6 +176,16 @@ static bool readU32(uintptr_t address, uint32_t* value) {
     return value != nullptr && readMemory(address, value, sizeof(*value));
 }
 
+static bool copyObjectWords(uintptr_t object, uintptr_t* words, size_t count) {
+    if (words == nullptr || count == 0 || count > kObjectScanBytes / sizeof(uintptr_t)) {
+        return false;
+    }
+    const size_t bytes = count * sizeof(uintptr_t);
+    if (!makeReadable(object, bytes)) return false;
+    std::memcpy(words, reinterpret_cast<const void*>(object), bytes);
+    return true;
+}
+
 enum class DexFormat { NONE, DEX, CDEX };
 
 static DexFormat dexFormat(uintptr_t address, char version[4]) {
@@ -203,6 +221,27 @@ static bool writeAll(int fd, const uint8_t* bytes, size_t length) {
     return true;
 }
 
+static bool containsAscii(const std::vector<uint8_t>& bytes, const char* marker) {
+    if (marker == nullptr || *marker == '\0') return false;
+    const size_t length = std::strlen(marker);
+    if (length == 0 || bytes.size() < length) return false;
+    const auto it = std::search(bytes.begin(), bytes.end(), marker, marker + length);
+    return it != bytes.end();
+}
+
+static bool isInjectedFrameworkDex(const std::vector<uint8_t>& image) {
+    // These markers identify LSPosed/Xposed support DEXes that are added to
+    // the target process by the hooking framework.  They share the target's
+    // mCookie and must not be mistaken for application payloads.
+    static constexpr const char* kMarkers[] = {
+            "LSPHooker", "xposed/dummy", "libxposed", "XposedInterface", "XC_MethodHook"
+    };
+    for (const char* marker : kMarkers) {
+        if (containsAscii(image, marker)) return true;
+    }
+    return false;
+}
+
 static bool copyMemory(uintptr_t address, size_t length, std::vector<uint8_t>* output) {
     if (output == nullptr || length == 0 || length > kMaxDexSize) return false;
     output->resize(length);
@@ -224,7 +263,8 @@ static bool copyMemory(uintptr_t address, size_t length, std::vector<uint8_t>* o
 }
 
 static bool dumpDexImage(uintptr_t begin, size_t hintedSize, const char* outputPath,
-                         long* writtenSize) {
+                         long* writtenSize, bool* skipped = nullptr) {
+    if (skipped != nullptr) *skipped = false;
     char version[4] = {0};
     const DexFormat format = dexFormat(begin, version);
     if (format == DexFormat::NONE) return false;
@@ -238,6 +278,16 @@ static bool dumpDexImage(uintptr_t begin, size_t hintedSize, const char* outputP
 
     std::vector<uint8_t> image;
     if (!copyMemory(begin, imageSize, &image)) return false;
+    // LSPosed injects tiny per-hook DEX files into the same ART cookie as the
+    // target APK.  They contain only the generated LSPHooker_ class and are
+    // not application payloads; emitting them made a three-dex target look
+    // like seven files.  Ignore this well-known marker while retaining every
+    // real application DEX (including small anti-hijack payloads).
+    if (isInjectedFrameworkDex(image)) {
+        if (skipped != nullptr) *skipped = true;
+        nativeLog("skip injected framework DEX begin=%" PRIxPTR " size=%zu", begin, imageSize);
+        return false;
+    }
     const int fd = open(outputPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return false;
     const bool ok = writeAll(fd, image.data(), image.size());
@@ -249,47 +299,139 @@ static bool dumpDexImage(uintptr_t begin, size_t hintedSize, const char* outputP
     return true;
 }
 
-// Search an ART object for a pointer to DEX bytes followed by its size field.
-static long tryDumpBeginInStruct(uintptr_t object, const char* outputPath,
-                                 int* magicCandidates) {
-    if (object == 0 || !makeReadable(object, 16)) return 0;
-    for (size_t offset = 0; offset + 16 <= 512; offset += sizeof(uintptr_t)) {
-        uintptr_t begin = 0;
-        if (!readPointer(object + offset, &begin) || begin == 0) continue;
-        char version[4] = {0};
-        const DexFormat format = dexFormat(begin, version);
-        if (format == DexFormat::NONE) continue;
-        if (magicCandidates != nullptr) ++(*magicCandidates);
-        size_t hintedSize = 0;
-        const uintptr_t sizeAddress = object + offset + sizeof(uintptr_t);
-        if (sizeof(size_t) == 8) {
-            uint64_t value = 0;
-            if (readMemory(sizeAddress, &value, sizeof(value))) hintedSize = static_cast<size_t>(value);
-        } else {
-            uint32_t value = 0;
-            if (readU32(sizeAddress, &value)) hintedSize = value;
-        }
+// A single java DexFile can own more than one native ART DexFile.  This is
+// represented by a long[] mCookie for APKs containing secondary dex files.
+// Keep every successfully located image instead of stopping at the first one.
+// The first image uses the requested path; subsequent images use path.1,
+// path.2, ... and are collected by the Java wrapper.
+struct DumpCollector {
+    explicit DumpCollector(const char* path) : basePath(path == nullptr ? "" : path) {}
+
+    bool dump(uintptr_t begin, size_t hintedSize) {
+        if (begin == 0 || basePath.empty()) return false;
+        if (skippedBegins.find(begin) != skippedBegins.end()) return false;
+        if (!seenBegins.insert(begin).second) return false;
+        const std::string path = count == 0
+                ? basePath
+                : basePath + "." + std::to_string(count);
         long written = 0;
-        if (dumpDexImage(begin, hintedSize, outputPath, &written)) return written;
-        nativeLog("DEX magic candidate at object+0x%zx was not a complete readable image", offset);
+        bool skipped = false;
+        if (!dumpDexImage(begin, hintedSize, path.c_str(), &written, &skipped)) {
+            seenBegins.erase(begin);
+            if (skipped) skippedBegins.insert(begin);
+            return false;
+        }
+        ++count;
+        totalBytes += written;
+        return true;
     }
-    return 0;
+
+    std::string basePath;
+    size_t count = 0;
+    long totalBytes = 0;
+    std::unordered_set<uintptr_t> seenBegins;
+    std::unordered_set<uintptr_t> skippedBegins;
+};
+
+static uintptr_t normalizePointer(uintptr_t value);
+
+static uintptr_t normalizePointer(uintptr_t value) {
+#if defined(__aarch64__)
+    // Android may carry a top-byte allocation tag (or PAC metadata) on a
+    // pointer copied through a long[] cookie.  ART's native addresses live in
+    // the lower 56 bits on arm64; stripping only the top byte preserves the
+    // canonical user-space address while leaving ordinary pointers unchanged.
+    return value & UINT64_C(0x00ffffffffffffff);
+#else
+    return value;
+#endif
 }
 
-static long dumpFromPtr(uintptr_t dexFilePointer, const char* outputPath, int* magicCandidates) {
-    if (dexFilePointer == 0) return 0;
-    long size = tryDumpBeginInStruct(dexFilePointer, outputPath, magicCandidates);
-    if (size > 0) return size;
-    // A cookie can point at an intermediate ART object containing DexFile*.
-    if (!makeReadable(dexFilePointer, 16)) return 0;
-    for (size_t offset = 0; offset + sizeof(uintptr_t) <= 256; offset += sizeof(uintptr_t)) {
-        uintptr_t nested = 0;
-        if (!readPointer(dexFilePointer + offset, &nested) || nested == 0 ||
-                nested == dexFilePointer) continue;
-        size = tryDumpBeginInStruct(nested, outputPath, magicCandidates);
-        if (size > 0) return size;
+static size_t tryDumpDirectDexAll(uintptr_t candidate, DumpCollector* collector,
+                                  int* magicCandidates) {
+    if (collector == nullptr) return 0;
+    candidate = normalizePointer(candidate);
+    if (candidate == 0 || !rangeReadableCached(candidate, sizeof(uintptr_t))) return 0;
+    char version[4] = {0};
+    if (dexFormat(candidate, version) == DexFormat::NONE) return 0;
+    if (magicCandidates != nullptr) ++(*magicCandidates);
+    return collector->dump(candidate, 0) ? 1u : 0u;
+}
+
+static size_t tryDumpBeginInStructAll(uintptr_t object, DumpCollector* collector,
+                                      int* magicCandidates) {
+    if (object == 0 || collector == nullptr) return 0;
+    constexpr size_t kWordCount = kObjectScanBytes / sizeof(uintptr_t);
+    uintptr_t words[kWordCount] = {};
+    if (!copyObjectWords(object, words, kWordCount)) return 0;
+    size_t dumped = 0;
+    for (size_t index = 0; index + 1 < kWordCount; ++index) {
+        const uintptr_t begin = normalizePointer(words[index]);
+        if (begin == 0 || !rangeReadableCached(begin, sizeof(uintptr_t))) continue;
+        char version[4] = {0};
+        if (dexFormat(begin, version) == DexFormat::NONE) continue;
+        if (magicCandidates != nullptr) ++(*magicCandidates);
+        if (collector->dump(begin, static_cast<size_t>(words[index + 1]))) ++dumped;
     }
-    return 0;
+    return dumped;
+}
+
+// Graph variant of the scanner above.  It deliberately keeps walking after a
+// match because the same cookie may reference several NativeDexFile objects.
+static size_t scanCookieGraphAll(uintptr_t root, DumpCollector* collector,
+                                 int* magicCandidates) {
+    if (collector == nullptr) return 0;
+    root = normalizePointer(root);
+    if (root == 0) return 0;
+    struct Node { uintptr_t address; int depth; };
+    std::deque<Node> pending;
+    std::unordered_set<uintptr_t> visited;
+    pending.push_back({root, 0});
+    size_t dumped = 0;
+
+    while (!pending.empty() && visited.size() < kMaxGraphNodes) {
+        const Node node = pending.front();
+        pending.pop_front();
+        const uintptr_t object = normalizePointer(node.address);
+        if (object == 0 || !visited.insert(object).second) continue;
+        constexpr size_t kWordCount = kObjectScanBytes / sizeof(uintptr_t);
+        uintptr_t words[kWordCount] = {};
+        if (!copyObjectWords(object, words, kWordCount)) continue;
+
+        for (size_t index = 0; index < kWordCount; ++index) {
+            const uintptr_t pointer = normalizePointer(words[index]);
+            if (pointer == 0 || pointer == object ||
+                    !rangeReadableCached(pointer, sizeof(uintptr_t))) continue;
+            char version[4] = {0};
+            const DexFormat format = dexFormat(pointer, version);
+            if (format != DexFormat::NONE) {
+                if (magicCandidates != nullptr) ++(*magicCandidates);
+                if (collector->dump(pointer, 0)) ++dumped;
+                // DEX bytes are not ART objects; do not enqueue their contents.
+                continue;
+            }
+            if (node.depth >= kMaxGraphDepth || visited.size() >= kMaxGraphNodes) continue;
+            if (rangeReadableCached(pointer, sizeof(uintptr_t))) {
+                pending.push_back({pointer, node.depth + 1});
+            }
+        }
+    }
+    nativeLog("cookie graph all scan exhausted nodes=%zu dumped=%zu",
+              visited.size(), dumped);
+    return dumped;
+}
+
+static size_t dumpFromPtrAll(uintptr_t dexFilePointer, DumpCollector* collector,
+                            int* magicCandidates) {
+    if (collector == nullptr) return 0;
+    dexFilePointer = normalizePointer(dexFilePointer);
+    if (dexFilePointer == 0) return 0;
+    size_t dumped = tryDumpDirectDexAll(dexFilePointer, collector, magicCandidates);
+    dumped += tryDumpBeginInStructAll(dexFilePointer, collector, magicCandidates);
+    // The struct scan handles the common layout.  The bounded graph catches
+    // ART holder objects and additional dex pointers at a different depth.
+    dumped += scanCookieGraphAll(dexFilePointer, collector, magicCandidates);
+    return dumped;
 }
 
 // JNI reflection helper: find a field along the DexFile class hierarchy.
@@ -398,15 +540,14 @@ Java_com_ctf_dexdumper_NativeBridge_dumpDexFromDexFile(
     env->DeleteLocalRef(cookie);
 
     int magicCandidates = 0;
-    long best = 0;
+    DumpCollector collector(outputPath.c_str());
     for (uintptr_t candidate : candidates) {
         if (candidate == 0) continue;
-        const long dumped = dumpFromPtr(candidate, outputPath.c_str(), &magicCandidates);
-        if (dumped > 0) { best = dumped; break; }
+        dumpFromPtrAll(candidate, &collector, &magicCandidates);
     }
-    nativeLog("pointer scan candidates=%zu dexMagicCandidates=%d result=%ld",
-              candidates.size(), magicCandidates, best);
-    if (best == 0) javaNativeLog(env, "pointer scan completed with no readable DEX image");
+    nativeLog("pointer scan candidates=%zu dexMagicCandidates=%d dumped=%zu resultBytes=%ld",
+              candidates.size(), magicCandidates, collector.count, collector.totalBytes);
+    if (collector.count == 0) javaNativeLog(env, "pointer scan completed with no readable DEX image");
     g_logEnv = nullptr;
-    return static_cast<jint>(best);
+    return static_cast<jint>(collector.totalBytes);
 }

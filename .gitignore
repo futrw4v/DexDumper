@@ -3,6 +3,7 @@
 **/build/
 /dist/*
 !/dist/DexDumper-release.apk
+!/dist/DexDumper-multidex-release.apk
 build.log
 build-release.log
 *.log
