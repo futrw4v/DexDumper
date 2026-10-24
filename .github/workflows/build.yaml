@@ -23,8 +23,7 @@ jobs:
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
       with:
-        build-tools-version: "34.0.0"
-        android-version: "platforms;android-34"
+        items: platform-tools,platforms;android-34,build-tools;34.0.0
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
